@@ -1,0 +1,21 @@
+venta_id,fecha,sku,cantidad,canal,precio_venta,cliente,metodo_pago,estado_pago,notas
+c619cd6c,,17-HYDRA-LIPGLOSS,1,Almacén,210.0,Jefe Chiky + Chayo,Transferencia,Apartado,"Apartado 1 Chayo, falta pago + 1 vendido almacen"
+ce5717e8,,17-HYDRA-LIPGLOSS,2,Directo,210.0,Jefe Chiky + Chayo,Transferencia,Apartado,"Apartado 1 Chayo, falta pago + 1 vendido almacen"
+3c343044,,22-HYDRA-LIPGLOSS,2,Directo,210.0,Jefe Chiky,Transferencia,Pagado,
+01def080,,32-HYDRA-LIPGLOSS,1,Almacén,210.0,Jefe Chiky,Transferencia,Pendiente,falta pago almacen 210
+c8a04e9f,,32-HYDRA-LIPGLOSS,1,Directo,210.0,Jefe Chiky,Transferencia,Pendiente,falta pago almacen 210
+b11d9d74,,102-UNLIMITED-DOUBLE-TOUCH,1,Directo,245.0,Mamá (Alejandra),Transferencia,Pagado,
+467cdc6a,,120-UNLIMITED-DOUBLE-TOUCH,1,Directo,245.0,Trabajo Chiky,Transferencia,Pagado,
+b648aca2,,05-CREAMY-LIPLINER,1,Almacén,195.0,Jefe Chiky + Almacen,Transferencia,Pendiente,falta pago almacen 195
+0d16c0fb,,05-CREAMY-LIPLINER,1,Directo,195.0,Jefe Chiky + Almacen,Transferencia,Pendiente,falta pago almacen 195
+f8ddea2e,,06-CREAMY-LIPLINER,1,Almacén,195.0,Trabajo Chiky + almacen,Transferencia,Pendiente,Falta pago Almacen 195
+32e171a8,,06-CREAMY-LIPLINER,1,Directo,195.0,Trabajo Chiky + almacen,Transferencia,Pendiente,Falta pago Almacen 195
+9d088a8c,,06-VELVET-TOUCH-BLUSH,1,Directo,245.0,Pablo,Transferencia,Pagado,
+1e195ec6,,07-VELVET-TOUCH-BLUSH,1,Directo,230.0,Jefe Chiky,Transferencia,Pagado,
+21b4f591,,21-HYDRA-LIPGLOSS,1,Directo,210.0,Trabajo Chiky,Transferencia,Pagado,
+2864e977,,TRAVEL-BRUSH-SET,1,Directo,300.0,Trabajo Chiky,Transferencia,Pagado,
+1237b39c,,06-COLOURED-BALM,1,Almacén,165.0,Sofis/almacen,Efectivo,Pendiente,Vendido almacen falta pago
+9a37b680,,06-COLOURED-BALM,1,Directo,165.0,Sofis/almacen,Efectivo,Pendiente,Vendido almacen falta pago
+67803000,,08-COLOURED-BALM,2,Directo,165.0,Pablo/Marcia,Transferencia,Pendiente,Falta pago Marcia
+43b6f62a,,21-HYDRA-LIPGLOSS,1,Directo,210.0,Chayo,Otro,Apartado,Apartado chayo/falta pago
+da6638d2,,22-HYDRA-LIPGLOSS,1,Directo,210.0,Marcia,Otro,Pendiente,Marcia/falta pago
