@@ -173,11 +173,19 @@ h1, h2, h3, h4 {{ font-family: 'Playfair Display', serif !important; color: var(
 .brandline {{ letter-spacing:.34em; text-transform:uppercase; font-size:.7rem; color:var(--gold-dark); font-weight:600; }}
 
 footer, #MainMenu {{ visibility:hidden; }}
-.block-container {{ padding-top:1.6rem; padding-bottom:3rem; }}
+.block-container {{ max-width: 1240px; margin: 0 auto; padding-top:1.4rem; padding-bottom:3rem; }}
+
+/* Densidad / tamaños en pantallas grandes */
+@media (min-width:1100px) {{
+  .module-head h1 {{ font-size:1.85rem; }}
+  .kpi .value {{ font-size:1.5rem; }}
+  .kpi {{ padding:16px 16px 14px; }}
+  .panel {{ padding:18px 20px; }}
+}}
 
 @media (max-width:640px) {{
   .module-head h1 {{ font-size:1.6rem; }}
-  .kpi .value {{ font-size:1.45rem; }}
+  .kpi .value {{ font-size:1.4rem; }}
   .block-container {{ padding-left:.6rem; padding-right:.6rem; }}
 }}
 </style>
@@ -343,6 +351,7 @@ def _rol_para(nombre: str, email: str) -> str:
 def register_user(username, nombre, email, password):
     df = load_usuarios()
     uname = str(username).strip()
+    password = str(password).strip()
     if not uname or not password:
         return False, "Usuario y contraseña son obligatorios."
     if len(password) < 6:
@@ -356,7 +365,7 @@ def register_user(username, nombre, email, password):
         "creado": date.today().isoformat(),
     }
     ws = get_spreadsheet().worksheet(USUARIOS_TAB)
-    ws.append_row([row[c] for c in USUARIOS_COLS], value_input_option="USER_ENTERED")
+    ws.append_row([row[c] for c in USUARIOS_COLS], value_input_option="RAW")
     read_tab.clear()
     return True, row
 
@@ -366,16 +375,33 @@ def authenticate(login_id, password):
     if df.empty:
         return None
     lid = str(login_id).strip().lower()
-    mask = ((df["username"].astype(str).str.lower() == lid)
-            | (df["email"].astype(str).str.lower() == lid))
+    password = str(password).strip()
+    mask = ((df["username"].astype(str).str.strip().str.lower() == lid)
+            | (df["email"].astype(str).str.strip().str.lower() == lid))
     rows = df[mask]
     if rows.empty:
         return None
     u = rows.iloc[0]
-    if verify_password(password, u["pass_hash"]):
+    if verify_password(password, str(u["pass_hash"]).strip()):
         return {"username": u["username"], "nombre": u["nombre"],
                 "rol": u["rol"], "email": u["email"]}
     return None
+
+
+def reset_password(login_id, new_password):
+    """Restablece la contraseña de un usuario por username o correo."""
+    df = load_usuarios()
+    new_password = str(new_password).strip()
+    if len(new_password) < 6:
+        return False, "La contraseña debe tener al menos 6 caracteres."
+    lid = str(login_id).strip().lower()
+    mask = ((df["username"].astype(str).str.strip().str.lower() == lid)
+            | (df["email"].astype(str).str.strip().str.lower() == lid))
+    if not mask.any():
+        return False, "No encontré ese usuario o correo."
+    df.loc[mask, "pass_hash"] = hash_password(new_password)
+    write_tab(USUARIOS_TAB, df, USUARIOS_COLS)
+    return True, df[mask].iloc[0]["nombre"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1381,7 +1407,7 @@ def screen_auth() -> bool:
     if primer_uso:
         st.info("Primer ingreso: creá tu cuenta. Pablo Orozco entra como administrador.")
 
-    tab_in, tab_reg = st.tabs(["Ingresar", "Crear cuenta"])
+    tab_in, tab_reg, tab_rec = st.tabs(["Ingresar", "Crear cuenta", "Recuperar acceso"])
 
     with tab_in:
         lid = st.text_input("Usuario o correo", key="li_user")
@@ -1421,6 +1447,30 @@ def screen_auth() -> bool:
                     st.rerun()
                 else:
                     st.error(res)
+
+    with tab_rec:
+        recovery = st.secrets.get("luminara", {}).get("recovery_code", "")
+        if not recovery:
+            st.info("Para recuperar tu contraseña, pedile al administrador (Pablo) que te la "
+                    "restablezca desde la sección **Usuarios**. Si sos el administrador y querés "
+                    "recuperación propia, agregá `recovery_code = \"tu-clave\"` en los Secrets.")
+        else:
+            st.caption("Ingresá tu usuario, el código de recuperación y tu nueva contraseña.")
+            rec_id = st.text_input("Usuario o correo", key="rc_id")
+            rec_code = st.text_input("Código de recuperación", type="password", key="rc_code")
+            rec_p1 = st.text_input("Nueva contraseña", type="password", key="rc_p1")
+            rec_p2 = st.text_input("Repetir nueva contraseña", type="password", key="rc_p2")
+            if st.button("Restablecer contraseña", type="primary", use_container_width=True, key="rc_btn"):
+                if rec_code.strip() != str(recovery).strip():
+                    st.error("Código de recuperación inválido.")
+                elif rec_p1 != rec_p2:
+                    st.error("Las contraseñas no coinciden.")
+                else:
+                    ok, res = reset_password(rec_id, rec_p1)
+                    if ok:
+                        st.success(f"Listo, {res}. Ya podés ingresar con tu nueva contraseña.")
+                    else:
+                        st.error(res)
 
     st.markdown("</div></div>", unsafe_allow_html=True)
     return False
