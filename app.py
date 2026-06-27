@@ -11,7 +11,7 @@ Stock disponible = cantidad_comprada − Σ ventas.cantidad
 """
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -26,6 +26,7 @@ LOGO = str(ASSETS / "luminara_logo.png")
 
 PRODUCTOS_TAB = "Productos"
 VENTAS_TAB = "Ventas"
+PAGOS_TAB = "Pagos"
 
 PRODUCTOS_COLS = [
     "sku", "linea", "tono", "categoria", "pedido", "fecha_pedido",
@@ -36,9 +37,15 @@ VENTAS_COLS = [
     "venta_id", "fecha", "sku", "cantidad", "canal", "precio_venta",
     "cliente", "metodo_pago", "estado_pago", "notas",
 ]
+PAGOS_COLS = [
+    "pago_id", "fecha", "cliente", "monto", "metodo_pago", "tipo",
+    "referencia", "ventas_ids", "comprobante", "notas",
+]
 
 CANALES = ["En línea", "Vintage Boutique", "Almacén", "Directo", "Otro"]
 METODOS_PAGO = ["Transferencia", "Efectivo", "Tarjeta", "Otro"]
+PAGOS_METODOS = ["Transferencia", "Efectivo", "Depósito", "Tarjeta", "Cheque", "Otro"]
+TIPOS_PAGO = ["Pago completo", "Abono", "Apartado"]
 ESTADOS_PAGO = ["Pagado", "Pendiente", "Apartado"]
 CATEGORIAS = ["Labios", "Rostro", "Ojos", "Labios y Mejillas", "Brochas", "General"]
 
@@ -168,6 +175,7 @@ footer, #MainMenu {{ visibility:hidden; }}
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/devstorage.read_write",
 ]
 
 
@@ -195,7 +203,8 @@ def get_spreadsheet():
 def ensure_schema():
     ss = get_spreadsheet()
     existing = {w.title: w for w in ss.worksheets()}
-    for name, cols in [(PRODUCTOS_TAB, PRODUCTOS_COLS), (VENTAS_TAB, VENTAS_COLS)]:
+    for name, cols in [(PRODUCTOS_TAB, PRODUCTOS_COLS), (VENTAS_TAB, VENTAS_COLS),
+                       (PAGOS_TAB, PAGOS_COLS)]:
         if name not in existing:
             ws = ss.add_worksheet(title=name, rows=300, cols=len(cols))
             ws.update([cols], "A1")
@@ -231,6 +240,56 @@ def append_venta(row: dict):
     ws = get_spreadsheet().worksheet(VENTAS_TAB)
     ws.append_row([row.get(c, "") for c in VENTAS_COLS], value_input_option="USER_ENTERED")
     read_tab.clear()
+
+
+def append_pago(row: dict):
+    ws = get_spreadsheet().worksheet(PAGOS_TAB)
+    ws.append_row([row.get(c, "") for c in PAGOS_COLS], value_input_option="USER_ENTERED")
+    read_tab.clear()
+
+
+def mark_ventas_pagadas(venta_ids: list):
+    """Marca como Pagado las ventas indicadas (reescribe la pestaña Ventas)."""
+    if not venta_ids:
+        return
+    df = read_tab(VENTAS_TAB, VENTAS_COLS).copy()
+    df.loc[df["venta_id"].astype(str).isin([str(v) for v in venta_ids]), "estado_pago"] = "Pagado"
+    write_tab(VENTAS_TAB, df, VENTAS_COLS)
+
+
+# ── Google Cloud Storage (comprobantes) ───────────────────────────────────────
+def gcs_enabled() -> bool:
+    return bool(st.secrets.get("luminara", {}).get("gcs_bucket"))
+
+
+@st.cache_resource(show_spinner=False)
+def get_bucket():
+    from google.cloud import storage
+    from google.oauth2.service_account import Credentials
+
+    info = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(info)
+    client = storage.Client(project=info.get("project_id"), credentials=creds)
+    return client.bucket(st.secrets["luminara"]["gcs_bucket"])
+
+
+def upload_comprobante(uploaded_file) -> str:
+    ext = Path(uploaded_file.name).suffix.lower() or ".bin"
+    blob_name = f"comprobantes/{date.today():%Y/%m}/{uuid.uuid4().hex}{ext}"
+    blob = get_bucket().blob(blob_name)
+    blob.upload_from_file(uploaded_file, content_type=getattr(uploaded_file, "type", None))
+    return blob_name
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def comprobante_url(blob_name: str) -> str:
+    if not blob_name or not gcs_enabled():
+        return ""
+    try:
+        return get_bucket().blob(blob_name).generate_signed_url(
+            expiration=timedelta(hours=12), version="v4")
+    except Exception:
+        return ""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -274,6 +333,15 @@ def load_data():
         vent["ganancia"] = (vent["precio_venta"] - vent["costo_con_envio"]) * vent["cantidad"]
         vent["fecha_dt"] = pd.to_datetime(vent["fecha"], errors="coerce")
     return prod, vent
+
+
+def load_pagos() -> pd.DataFrame:
+    pg = read_tab(PAGOS_TAB, PAGOS_COLS).copy()
+    if pg.empty:
+        return pg
+    pg["monto"] = pd.to_numeric(pg["monto"], errors="coerce").fillna(0)
+    pg["fecha_dt"] = pd.to_datetime(pg["fecha"], errors="coerce")
+    return pg
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -782,6 +850,146 @@ def page_analisis():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  PÁGINA · PAGOS (comprobantes)
+# ──────────────────────────────────────────────────────────────────────────────
+def page_pagos():
+    head("Cobros y comprobantes", "Registrar pagos",
+         "Adjuntá el comprobante, registrá el método y saldá ventas pendientes")
+    prod, vent = load_data()
+    pagos = load_pagos()
+
+    por_cobrar = (vent.loc[vent["estado_pago"].isin(["Pendiente", "Apartado"]), "ingreso"].sum()
+                  if not vent.empty else 0)
+    cobrado = pagos["monto"].sum() if not pagos.empty else 0
+    n_pagos = len(pagos)
+    con_comp = int((pagos["comprobante"].astype(str).str.len() > 0).sum()) if not pagos.empty else 0
+    kpi_grid([
+        ("Por cobrar", q(por_cobrar), "ventas pendientes + apartadas"),
+        ("Total cobrado", q(cobrado), f"{n_pagos} pagos registrados"),
+        ("Con comprobante", f"{con_comp}/{n_pagos}" if n_pagos else "0", ""),
+        ("Almacenamiento", "GCS activo" if gcs_enabled() else "sin adjuntos", ""),
+    ])
+
+    if not gcs_enabled():
+        st.info("📎 Para adjuntar fotos o PDFs, configurá `gcs_bucket` en los Secrets "
+                "(ver README). Mientras tanto podés registrar pagos sin comprobante.")
+
+    tab_reg, tab_hist = st.tabs(["💳 Registrar pago", "🧾 Historial de pagos"])
+
+    # ── Registrar ──────────────────────────────────────────────────────────
+    with tab_reg:
+        pendientes = pd.DataFrame()
+        if not vent.empty:
+            pendientes = vent[vent["estado_pago"].isin(["Pendiente", "Apartado"])].copy()
+
+        sel_ids, sel_cliente, sugerido = [], "", 0.0
+        if not pendientes.empty:
+            st.markdown("**Ventas pendientes** (opcional: seleccioná las que se están saldando)")
+            pendientes["etq"] = pendientes.apply(
+                lambda r: f"{r['venta_id']} · {r['nombre']} · {r['cliente']} · {q(r['ingreso'])} ({r['estado_pago']})",
+                axis=1)
+            elegidas = st.multiselect("Ventas a saldar", pendientes["etq"].tolist(),
+                                      label_visibility="collapsed")
+            chosen = pendientes[pendientes["etq"].isin(elegidas)]
+            sel_ids = chosen["venta_id"].tolist()
+            sugerido = float(chosen["ingreso"].sum())
+            if not chosen.empty:
+                sel_cliente = chosen["cliente"].iloc[0]
+        else:
+            st.caption("No hay ventas pendientes. Podés registrar un pago general igual.")
+
+        ukey = st.session_state.get("pago_ukey", 0)
+        with st.form("nuevo_pago", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            cliente = c1.text_input("Cliente", value=sel_cliente)
+            monto = c2.number_input("Monto recibido *", min_value=0.0,
+                                    value=round(sugerido, 2), step=10.0, format="%.2f")
+            fecha_p = c3.date_input("Fecha", value=date.today())
+            c4, c5, c6 = st.columns(3)
+            metodo = c4.selectbox("Método *", PAGOS_METODOS)
+            tipo = c5.selectbox("Tipo", TIPOS_PAGO)
+            referencia = c6.text_input("Referencia / No. transacción")
+            comprobante = st.file_uploader(
+                "Comprobante (foto o PDF)", type=["png", "jpg", "jpeg", "webp", "pdf"],
+                key=f"comp_{ukey}", disabled=not gcs_enabled(),
+                help=None if gcs_enabled() else "Configurá GCS para habilitar adjuntos")
+            notas = st.text_input("Notas")
+            marcar = st.checkbox("Marcar las ventas seleccionadas como **Pagadas**",
+                                 value=bool(sel_ids), disabled=not sel_ids)
+
+            if st.form_submit_button("✓ Registrar pago", type="primary"):
+                if monto <= 0:
+                    st.error("El monto debe ser mayor a cero.")
+                else:
+                    blob = ""
+                    try:
+                        if comprobante is not None and gcs_enabled():
+                            with st.spinner("Subiendo comprobante…"):
+                                blob = upload_comprobante(comprobante)
+                        pago = {
+                            "pago_id": str(uuid.uuid4())[:8], "fecha": fecha_p.isoformat(),
+                            "cliente": cliente, "monto": monto, "metodo_pago": metodo,
+                            "tipo": tipo, "referencia": referencia,
+                            "ventas_ids": ",".join(map(str, sel_ids)), "comprobante": blob,
+                            "notas": notas,
+                        }
+                        append_pago(pago)
+                        if marcar and sel_ids:
+                            mark_ventas_pagadas(sel_ids)
+                        st.session_state["pago_ukey"] = ukey + 1
+                        st.success(f"Pago de {q(monto)} registrado"
+                                   + (" · comprobante adjuntado" if blob else ""))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo registrar el pago: {e}")
+
+    # ── Historial ──────────────────────────────────────────────────────────
+    with tab_hist:
+        if pagos.empty:
+            st.info("Aún no hay pagos registrados.")
+            return
+        f1, f2 = st.columns([1, 2])
+        met_f = f1.selectbox("Método", ["Todos"] + PAGOS_METODOS)
+        busca = f2.text_input("Buscar cliente / referencia", placeholder="Buscar…")
+        v = pagos.sort_values("fecha_dt", ascending=False, na_position="last").copy()
+        if met_f != "Todos":
+            v = v[v["metodo_pago"] == met_f]
+        if busca:
+            b = busca.lower()
+            v = v[v["cliente"].astype(str).str.lower().str.contains(b)
+                  | v["referencia"].astype(str).str.lower().str.contains(b)]
+
+        for _, p in v.iterrows():
+            with st.container():
+                col_a, col_b = st.columns([2.4, 1])
+                with col_a:
+                    st.markdown(
+                        f"""<div class="panel" style="margin-bottom:.6rem">
+                        <div style="display:flex;justify-content:space-between;align-items:baseline">
+                          <span style="font-family:'Playfair Display',serif;font-size:1.3rem">{q(p['monto'])}</span>
+                          <span style="color:{GOLD_DARK};font-weight:600;font-size:.8rem">{p['metodo_pago']} · {p['tipo']}</span>
+                        </div>
+                        <div style="color:var(--muted);font-size:.85rem;margin-top:.25rem">
+                          {p['cliente'] or '—'} &nbsp;·&nbsp; {p['fecha'] or 's/f'}
+                          {f"&nbsp;·&nbsp; Ref: {p['referencia']}" if p['referencia'] else ""}
+                        </div>
+                        {f'<div style="margin-top:.4rem;font-size:.85rem">{p["notas"]}</div>' if p['notas'] else ''}
+                        </div>""",
+                        unsafe_allow_html=True)
+                with col_b:
+                    blob = str(p["comprobante"])
+                    if blob:
+                        url = comprobante_url(blob)
+                        if blob.lower().endswith(".pdf"):
+                            if url:
+                                st.link_button("📄 Ver comprobante (PDF)", url, use_container_width=True)
+                        elif url:
+                            st.image(url, use_container_width=True)
+                    else:
+                        st.caption("Sin comprobante")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  PANTALLAS DE SISTEMA: configuración pendiente / login
 # ──────────────────────────────────────────────────────────────────────────────
 def screen_setup():
@@ -865,6 +1073,7 @@ def main():
         "✦  Resumen": page_resumen,
         "📦  Inventario": page_inventario,
         "🛒  Registrar venta": page_registrar,
+        "💳  Registrar pagos": page_pagos,
         "🧾  Historial de ventas": page_ventas,
         "📊  Análisis de canal": page_analisis,
     }
