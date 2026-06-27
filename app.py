@@ -473,6 +473,8 @@ def page_inventario():
                      "vendidos", "stock", "valor_stock_venta"]].copy()
         show.columns = ["SKU", "Producto", "Categoría", "Pedido", "Costo", "Precio",
                         "Gan./u", "Comprado", "Vendido", "Stock", "Valor stock"]
+        _maxc = prod["cantidad_comprada"].max()
+        stock_max = int(_maxc) if pd.notna(_maxc) and _maxc > 0 else 1
         st.dataframe(
             show, use_container_width=True, hide_index=True,
             column_config={
@@ -481,8 +483,7 @@ def page_inventario():
                 "Gan./u": st.column_config.NumberColumn(format="Q%.2f"),
                 "Valor stock": st.column_config.NumberColumn(format="Q%.2f"),
                 "Stock": st.column_config.ProgressColumn(
-                    format="%d", min_value=0,
-                    max_value=int(max(prod["cantidad_comprada"].max(), 1))),
+                    format="%d", min_value=0, max_value=stock_max),
             },
         )
 
