@@ -11,6 +11,10 @@ Stock disponible = cantidad_comprada − Σ ventas.cantidad
 """
 
 import uuid
+import os
+import hmac
+import hashlib
+import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -27,6 +31,7 @@ LOGO = str(ASSETS / "luminara_logo.png")
 PRODUCTOS_TAB = "Productos"
 VENTAS_TAB = "Ventas"
 PAGOS_TAB = "Pagos"
+USUARIOS_TAB = "Usuarios"
 
 PRODUCTOS_COLS = [
     "sku", "linea", "tono", "categoria", "pedido", "fecha_pedido",
@@ -41,6 +46,16 @@ PAGOS_COLS = [
     "pago_id", "fecha", "cliente", "monto", "metodo_pago", "tipo",
     "referencia", "ventas_ids", "comprobante", "notas",
 ]
+USUARIOS_COLS = ["username", "nombre", "email", "rol", "pass_hash", "creado"]
+
+# Quien registre con estos correos o nombres entra como administrador
+ADMIN_EMAILS = {"juanpabloorozcoperez89@gmail.com"}
+ADMIN_NAMES = {"pablo orozco"}
+# Nombre con que se saluda a personas conocidas, sin importar cómo lo escriban
+DISPLAY_OVERRIDES = {
+    "pablo orozco": "Pablo Orozco",
+    "keren orozco": "Licda. Keren Orozco",
+}
 
 CANALES = ["En línea", "Vintage Boutique", "Almacén", "Directo", "Otro"]
 METODOS_PAGO = ["Transferencia", "Efectivo", "Tarjeta", "Otro"]
@@ -204,7 +219,7 @@ def ensure_schema():
     ss = get_spreadsheet()
     existing = {w.title: w for w in ss.worksheets()}
     for name, cols in [(PRODUCTOS_TAB, PRODUCTOS_COLS), (VENTAS_TAB, VENTAS_COLS),
-                       (PAGOS_TAB, PAGOS_COLS)]:
+                       (PAGOS_TAB, PAGOS_COLS), (USUARIOS_TAB, USUARIOS_COLS)]:
         if name not in existing:
             ws = ss.add_worksheet(title=name, rows=300, cols=len(cols))
             ws.update([cols], "A1")
@@ -290,6 +305,77 @@ def comprobante_url(blob_name: str) -> str:
             expiration=timedelta(hours=12), version="v4")
     except Exception:
         return ""
+
+
+# ── Autenticación (usuarios en pestaña Usuarios) ───────────────────────────────
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower().strip()
+    return " ".join(s.split())
+
+
+def hash_password(password: str, iterations: int = 200_000) -> str:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"pbkdf2${iterations}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iters, salt_hex, hash_hex = str(stored).split("$")
+        if algo != "pbkdf2":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(iters))
+        return hmac.compare_digest(dk.hex(), hash_hex)
+    except Exception:
+        return False
+
+
+def load_usuarios() -> pd.DataFrame:
+    return read_tab(USUARIOS_TAB, USUARIOS_COLS).copy()
+
+
+def _rol_para(nombre: str, email: str) -> str:
+    if _norm(email) in ADMIN_EMAILS or _norm(nombre) in ADMIN_NAMES:
+        return "admin"
+    return "usuario"
+
+
+def register_user(username, nombre, email, password):
+    df = load_usuarios()
+    uname = str(username).strip()
+    if not uname or not password:
+        return False, "Usuario y contraseña son obligatorios."
+    if len(password) < 6:
+        return False, "La contraseña debe tener al menos 6 caracteres."
+    if not df.empty and (df["username"].astype(str).str.lower() == uname.lower()).any():
+        return False, "Ese nombre de usuario ya existe."
+    display = DISPLAY_OVERRIDES.get(_norm(nombre), str(nombre).strip() or uname)
+    row = {
+        "username": uname, "nombre": display, "email": str(email).strip(),
+        "rol": _rol_para(nombre, email), "pass_hash": hash_password(password),
+        "creado": date.today().isoformat(),
+    }
+    ws = get_spreadsheet().worksheet(USUARIOS_TAB)
+    ws.append_row([row[c] for c in USUARIOS_COLS], value_input_option="USER_ENTERED")
+    read_tab.clear()
+    return True, row
+
+
+def authenticate(login_id, password):
+    df = load_usuarios()
+    if df.empty:
+        return None
+    lid = str(login_id).strip().lower()
+    mask = ((df["username"].astype(str).str.lower() == lid)
+            | (df["email"].astype(str).str.lower() == lid))
+    rows = df[mask]
+    if rows.empty:
+        return None
+    u = rows.iloc[0]
+    if verify_password(password, u["pass_hash"]):
+        return {"username": u["username"], "nombre": u["nombre"],
+                "rol": u["rol"], "email": u["email"]}
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -770,11 +856,9 @@ def page_ventas():
 # ──────────────────────────────────────────────────────────────────────────────
 #  PÁGINA · ANÁLISIS DE CANAL
 # ──────────────────────────────────────────────────────────────────────────────
-def page_analisis():
-    head("Inteligencia comercial", "Análisis de canal", "¿Dónde se vende más y dónde rinde mejor?")
-    prod, vent = load_data()
+def _tab_canales(prod, vent):
     if vent.empty:
-        st.info("Necesitás ventas registradas para el análisis.")
+        st.info("Necesitás ventas registradas para el análisis de canal.")
         return
 
     ch = vent.groupby("canal").agg(
@@ -847,6 +931,260 @@ def page_analisis():
         fig.update_layout(barmode="stack")
         st.plotly_chart(style_fig(fig, 300), use_container_width=True, config={"displayModeBar": False})
         st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  PÁGINA · ANÁLISIS (inteligencia ejecutiva)
+# ──────────────────────────────────────────────────────────────────────────────
+def page_analisis():
+    head("Inteligencia de negocio", "Análisis",
+         "Rentabilidad, rotación, canales, clientes y cartera")
+    prod, vent = load_data()
+    pagos = load_pagos()
+
+    if prod.empty:
+        st.info("Cargá tu catálogo y ventas para ver el análisis.")
+        return
+
+    # KPIs globales
+    ingresos = vent["ingreso"].sum() if not vent.empty else 0
+    ganancia = vent["ganancia"].sum() if not vent.empty else 0
+    inversion = prod["inversion"].sum()
+    margen_global = (ganancia / ingresos * 100) if ingresos else 0
+    comprado = prod["cantidad_comprada"].sum()
+    vendido = prod["vendidos"].sum()
+    sell_through = (vendido / comprado * 100) if comprado else 0
+    dead = prod[(prod["activo"]) & (prod["vendidos"] == 0) & (prod["stock"] > 0)]
+    capital_muerto = dead["valor_stock_costo"].sum()
+    roi = (ganancia / inversion * 100) if inversion else 0
+
+    kpi_grid([
+        ("Margen bruto", f"{margen_global:.1f}%", f"Ganancia {q(ganancia)}"),
+        ("Sell-through", f"{sell_through:.0f}%", f"{int(vendido)}/{int(comprado)} u. vendidas"),
+        ("ROI realizado", f"{roi:.0f}%", f"sobre {q(inversion)}"),
+        ("Ticket promedio", q(ingresos / len(vent)) if not vent.empty and len(vent) else "Q0.00", ""),
+        ("Capital inmóvil", q(capital_muerto), f"{len(dead)} prod. sin rotar"),
+    ])
+
+    t1, t2, t3, t4, t5 = st.tabs([
+        "💎 Rentabilidad", "🛍️ Ventas & canales", "📦 Rotación",
+        "👑 Clientes", "💰 Cartera",
+    ])
+
+    # ── Rentabilidad ────────────────────────────────────────────────────────
+    with t1:
+        if vent.empty:
+            st.info("Sin ventas para analizar rentabilidad.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown('<div class="panel"><h3>Margen por categoría</h3>', unsafe_allow_html=True)
+                cm = vent.groupby("categoria").agg(ing=("ingreso", "sum"),
+                                                   gan=("ganancia", "sum")).reset_index()
+                cm["margen"] = (cm["gan"] / cm["ing"].replace(0, 1) * 100).round(1)
+                cm = cm.sort_values("margen", ascending=False)
+                fig = go.Figure(go.Bar(
+                    x=cm["categoria"], y=cm["margen"], marker_color=GOLD,
+                    text=[f"{m:.0f}%" for m in cm["margen"]], textposition="outside",
+                    hovertemplate="%{x}: %{y:.1f}%<extra></extra>"))
+                st.plotly_chart(style_fig(fig, 300), use_container_width=True,
+                                config={"displayModeBar": False})
+                st.markdown("</div>", unsafe_allow_html=True)
+            with c2:
+                st.markdown('<div class="panel"><h3>Top productos por ganancia</h3>', unsafe_allow_html=True)
+                tg = vent.groupby("nombre")["ganancia"].sum().sort_values(ascending=False).head(10)
+                fig = go.Figure(go.Bar(
+                    x=tg.values, y=tg.index, orientation="h", marker_color=MAUVE,
+                    text=[q(v) for v in tg.values], textposition="auto",
+                    hovertemplate="%{y}: %{x:,.0f} Q<extra></extra>"))
+                fig.update_layout(yaxis=dict(autorange="reversed"))
+                st.plotly_chart(style_fig(fig, 300), use_container_width=True,
+                                config={"displayModeBar": False})
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            st.markdown('<div class="panel"><h3>Contribución a la ganancia (categoría → producto)</h3>',
+                        unsafe_allow_html=True)
+            tg = vent.groupby(["categoria", "nombre"])["ganancia"].sum().reset_index()
+            tg = tg[tg["ganancia"] > 0]
+            labels = ["Ganancia total"] + tg["categoria"].unique().tolist() + \
+                     (tg["categoria"] + " · " + tg["nombre"]).tolist()
+            parents = [""] + ["Ganancia total"] * tg["categoria"].nunique() + tg["categoria"].tolist()
+            values = [0] + [0] * tg["categoria"].nunique() + tg["ganancia"].tolist()
+            fig = go.Figure(go.Treemap(
+                labels=labels, parents=parents, values=values, branchvalues="remainder",
+                marker=dict(colors=[GOLD, MAUVE, ROSE, "#D9C4A3", BLUSH, GOLD_DARK] * 20),
+                textinfo="label+value+percent parent",
+                hovertemplate="%{label}<br>%{value:,.0f} Q<extra></extra>"))
+            st.plotly_chart(style_fig(fig, 380), use_container_width=True,
+                            config={"displayModeBar": False})
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            st.markdown('<div class="panel"><h3>ROI por pedido</h3>', unsafe_allow_html=True)
+            ped = prod.groupby("pedido").agg(inversion=("inversion", "sum")).reset_index()
+            gv = vent.groupby(prod.set_index("sku")["pedido"].reindex(vent["sku"]).values)["ganancia"].sum() \
+                if not vent.empty else pd.Series(dtype=float)
+            ped["ganancia"] = ped["pedido"].map(gv).fillna(0)
+            ped["ROI %"] = (ped["ganancia"] / ped["inversion"].replace(0, 1) * 100).round(0)
+            ped.columns = ["Pedido", "Inversión", "Ganancia realizada", "ROI %"]
+            st.dataframe(ped, use_container_width=True, hide_index=True, column_config={
+                "Inversión": st.column_config.NumberColumn(format="Q%.2f"),
+                "Ganancia realizada": st.column_config.NumberColumn(format="Q%.2f"),
+                "ROI %": st.column_config.NumberColumn(format="%.0f%%")})
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Ventas & canales ──────────────────────────────────────────────────────
+    with t2:
+        _tab_canales(prod, vent)
+        if not vent.empty and vent["fecha_dt"].notna().any():
+            st.markdown('<div class="panel"><h3>Tendencia de ingresos</h3>', unsafe_allow_html=True)
+            ts = (vent.dropna(subset=["fecha_dt"]).set_index("fecha_dt")
+                  .resample("W")["ingreso"].sum().reset_index())
+            fig = go.Figure(go.Scatter(x=ts["fecha_dt"], y=ts["ingreso"], mode="lines+markers",
+                                       line=dict(color=GOLD_DARK, width=2.5), fill="tozeroy",
+                                       fillcolor="rgba(191,161,95,.12)"))
+            st.plotly_chart(style_fig(fig, 280), use_container_width=True,
+                            config={"displayModeBar": False})
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Rotación / inventario ────────────────────────────────────────────────
+    with t3:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown('<div class="panel"><h3>Sell-through por producto</h3>', unsafe_allow_html=True)
+            st_df = prod[prod["cantidad_comprada"] > 0].copy()
+            st_df["st"] = (st_df["vendidos"] / st_df["cantidad_comprada"] * 100).round(0)
+            st_df = st_df.sort_values("st", ascending=False).head(12)
+            fig = go.Figure(go.Bar(
+                x=st_df["st"], y=st_df["nombre"], orientation="h",
+                marker=dict(color=st_df["st"], colorscale=[[0, ROSE], [1, GOLD]]),
+                text=[f"{v:.0f}%" for v in st_df["st"]], textposition="auto",
+                hovertemplate="%{y}: %{x:.0f}%<extra></extra>"))
+            fig.update_layout(yaxis=dict(autorange="reversed"))
+            st.plotly_chart(style_fig(fig, 360), use_container_width=True,
+                            config={"displayModeBar": False})
+            st.markdown("</div>", unsafe_allow_html=True)
+        with c2:
+            st.markdown('<div class="panel"><h3>Análisis ABC (Pareto de ingresos)</h3>',
+                        unsafe_allow_html=True)
+            if not vent.empty:
+                pareto = vent.groupby("nombre")["ingreso"].sum().sort_values(ascending=False).reset_index()
+                pareto["cum"] = (pareto["ingreso"].cumsum() / pareto["ingreso"].sum() * 100).round(1)
+                fig = go.Figure()
+                fig.add_bar(x=pareto["nombre"], y=pareto["ingreso"], marker_color=GOLD, name="Ingresos")
+                fig.add_trace(go.Scatter(x=pareto["nombre"], y=pareto["cum"], yaxis="y2",
+                                         mode="lines+markers", line=dict(color=MAUVE, width=2.5),
+                                         name="% acumulado"))
+                fig.update_layout(yaxis2=dict(overlaying="y", side="right", range=[0, 105],
+                                              showgrid=False, ticksuffix="%"),
+                                  xaxis=dict(showticklabels=False))
+                st.plotly_chart(style_fig(fig, 360), use_container_width=True,
+                                config={"displayModeBar": False})
+                n_a = int((pareto["cum"] <= 80).sum()) or 1
+                st.caption(f"**{n_a} productos** ({n_a/len(pareto)*100:.0f}% del catálogo vendido) "
+                           f"generan el ~80% de los ingresos. Esos son tus productos **A**: priorizá "
+                           f"su reposición.")
+            else:
+                st.caption("Sin ventas.")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown('<div class="panel"><h3>⚠️ Inventario sin rotación (capital inmóvil)</h3>',
+                    unsafe_allow_html=True)
+        if not dead.empty:
+            dd = dead[["nombre", "categoria", "pedido", "stock", "costo_con_envio",
+                       "valor_stock_costo", "valor_stock_venta"]].copy()
+            dd.columns = ["Producto", "Categoría", "Pedido", "Stock", "Costo unit.",
+                          "Capital (costo)", "Potencial (venta)"]
+            st.dataframe(dd.sort_values("Capital (costo)", ascending=False),
+                         use_container_width=True, hide_index=True, column_config={
+                             "Costo unit.": st.column_config.NumberColumn(format="Q%.2f"),
+                             "Capital (costo)": st.column_config.NumberColumn(format="Q%.2f"),
+                             "Potencial (venta)": st.column_config.NumberColumn(format="Q%.2f")})
+            st.caption(f"Tenés **{q(capital_muerto)}** inmovilizados en {len(dead)} productos que aún "
+                       f"no venden ni una unidad. Considerá promoción, bundle o reubicación de canal.")
+        else:
+            st.success("Todo tu inventario activo ha tenido al menos una venta. Excelente rotación.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Clientes ──────────────────────────────────────────────────────────────
+    with t4:
+        if vent.empty or vent["cliente"].astype(str).str.strip().eq("").all():
+            st.info("Registrá ventas con cliente para el análisis de clientes.")
+        else:
+            cl = vent[vent["cliente"].astype(str).str.strip() != ""].copy()
+            cli = cl.groupby("cliente").agg(
+                ingresos=("ingreso", "sum"), compras=("venta_id", "count"),
+                unidades=("cantidad", "sum")).reset_index()
+            cli["ticket"] = (cli["ingresos"] / cli["compras"].replace(0, 1)).round(2)
+            pend = cl[cl["estado_pago"].isin(["Pendiente", "Apartado"])].groupby("cliente")["ingreso"].sum()
+            cli["pendiente"] = cli["cliente"].map(pend).fillna(0)
+            cli = cli.sort_values("ingresos", ascending=False)
+
+            c1, c2 = st.columns([1.3, 1])
+            with c1:
+                st.markdown('<div class="panel"><h3>Top clientes por ingresos</h3>', unsafe_allow_html=True)
+                top = cli.head(10)
+                fig = go.Figure(go.Bar(
+                    x=top["ingresos"], y=top["cliente"], orientation="h", marker_color=GOLD,
+                    text=[q(v) for v in top["ingresos"]], textposition="auto",
+                    hovertemplate="%{y}: %{x:,.0f} Q<extra></extra>"))
+                fig.update_layout(yaxis=dict(autorange="reversed"))
+                st.plotly_chart(style_fig(fig, 360), use_container_width=True,
+                                config={"displayModeBar": False})
+                st.markdown("</div>", unsafe_allow_html=True)
+            with c2:
+                st.markdown('<div class="panel"><h3>Concentración</h3>', unsafe_allow_html=True)
+                top3 = cli.head(3)["ingresos"].sum()
+                conc = top3 / cli["ingresos"].sum() * 100 if cli["ingresos"].sum() else 0
+                kpi_grid([
+                    ("Clientes únicos", str(len(cli)), ""),
+                    ("Top 3 = % ingresos", f"{conc:.0f}%", "concentración"),
+                    ("Mejor cliente", cli.iloc[0]["cliente"][:18], q(cli.iloc[0]["ingresos"])),
+                ])
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            st.markdown('<div class="panel"><h3>Detalle por cliente</h3>', unsafe_allow_html=True)
+            tab = cli[["cliente", "compras", "unidades", "ingresos", "ticket", "pendiente"]].copy()
+            tab.columns = ["Cliente", "Compras", "Unidades", "Ingresos", "Ticket prom.", "Por cobrar"]
+            st.dataframe(tab, use_container_width=True, hide_index=True, column_config={
+                "Ingresos": st.column_config.NumberColumn(format="Q%.2f"),
+                "Ticket prom.": st.column_config.NumberColumn(format="Q%.2f"),
+                "Por cobrar": st.column_config.NumberColumn(format="Q%.2f")})
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Cartera / cobros ───────────────────────────────────────────────────────
+    with t5:
+        if vent.empty:
+            st.info("Sin ventas para analizar cartera.")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown('<div class="panel"><h3>Estado de la cartera</h3>', unsafe_allow_html=True)
+                est = vent.groupby("estado_pago")["ingreso"].sum().reindex(ESTADOS_PAGO).fillna(0)
+                colors = {"Pagado": "#9FBF8F", "Pendiente": ROSE, "Apartado": GOLD}
+                fig = go.Figure(go.Pie(labels=est.index, values=est.values, hole=.58,
+                                       marker=dict(colors=[colors[s] for s in est.index],
+                                                   line=dict(color="#FFF", width=2)),
+                                       textinfo="label+percent"))
+                st.plotly_chart(style_fig(fig, 300), use_container_width=True,
+                                config={"displayModeBar": False})
+                pendiente_total = est.get("Pendiente", 0) + est.get("Apartado", 0)
+                st.caption(f"Por cobrar: **{q(pendiente_total)}**")
+                st.markdown("</div>", unsafe_allow_html=True)
+            with c2:
+                st.markdown('<div class="panel"><h3>Cobrado por método</h3>', unsafe_allow_html=True)
+                if not pagos.empty:
+                    mm = pagos.groupby("metodo_pago")["monto"].sum().sort_values(ascending=False)
+                    fig = go.Figure(go.Bar(x=mm.values, y=mm.index, orientation="h",
+                                           marker_color=MAUVE, text=[q(v) for v in mm.values],
+                                           textposition="auto",
+                                           hovertemplate="%{y}: %{x:,.0f} Q<extra></extra>"))
+                    st.plotly_chart(style_fig(fig, 300), use_container_width=True,
+                                    config={"displayModeBar": False})
+                    con_comp = int((pagos["comprobante"].astype(str).str.len() > 0).sum())
+                    st.caption(f"**{con_comp}/{len(pagos)}** pagos con comprobante adjunto.")
+                else:
+                    st.caption("Aún no hay pagos registrados en el módulo de Pagos.")
+                st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1014,33 +1352,119 @@ token_uri = "https://oauth2.googleapis.com/token"
 
 [luminara]
 spreadsheet_id = "ID_DE_TU_SHEET"      # el que va entre /d/ y /edit en la URL
-app_password = "una-clave-opcional"    # opcional: protege el acceso
+# gcs_bucket = "luminara-comprobantes" # opcional: para adjuntar comprobantes
+# registro_codigo = "clave-de-invitacion"  # opcional: exige código al registrarse
 ''', language="toml")
-    st.caption("La app crea las pestañas **Productos** y **Ventas** automáticamente si no existen. "
-               "Podés sembrar datos pegando seed_productos.csv y seed_ventas.csv.")
+    st.caption("La app crea las pestañas **Productos**, **Ventas**, **Pagos** y **Usuarios** "
+               "automáticamente. El primer usuario que se registre con el correo o nombre de "
+               "Pablo Orozco entra como administrador.")
 
 
-def screen_login() -> bool:
-    pwd = st.secrets.get("luminara", {}).get("app_password", "")
-    if not pwd:
+def screen_auth() -> bool:
+    """Login / registro. Devuelve True si hay sesión activa."""
+    if st.session_state.get("user"):
         return True
-    if st.session_state.get("auth_ok"):
-        return True
+
+    try:
+        usuarios = load_usuarios()
+    except Exception as e:
+        st.error(f"No se pudo leer la lista de usuarios: {e}")
+        return False
+    primer_uso = usuarios.empty
+
     st.markdown('<div class="login-wrap">', unsafe_allow_html=True)
     if Path(LOGO).exists():
         st.image(LOGO, use_container_width=True)
-    st.markdown('<div class="login-card"><div class="brandline">Acceso privado</div>',
+    st.markdown('<div class="login-card"><div class="brandline">Acceso privado</div><br>',
                 unsafe_allow_html=True)
-    entry = st.text_input("Contraseña", type="password", label_visibility="collapsed",
-                          placeholder="Contraseña")
-    if st.button("Entrar", type="primary", use_container_width=True):
-        if entry == pwd:
-            st.session_state["auth_ok"] = True
-            st.rerun()
-        else:
-            st.error("Contraseña incorrecta.")
+
+    if primer_uso:
+        st.info("Primer ingreso: creá tu cuenta. Pablo Orozco entra como administrador.")
+
+    tab_in, tab_reg = st.tabs(["Ingresar", "Crear cuenta"])
+
+    with tab_in:
+        lid = st.text_input("Usuario o correo", key="li_user")
+        pw = st.text_input("Contraseña", type="password", key="li_pw")
+        if st.button("Entrar", type="primary", use_container_width=True, key="li_btn"):
+            user = authenticate(lid, pw)
+            if user:
+                st.session_state["user"] = user
+                st.rerun()
+            else:
+                st.error("Usuario o contraseña incorrectos.")
+
+    with tab_reg:
+        codigo_req = st.secrets.get("luminara", {}).get("registro_codigo", "")
+        nombre = st.text_input("Nombre completo", key="rg_nombre",
+                               placeholder="Ej. Keren Orozco")
+        username = st.text_input("Nombre de usuario", key="rg_user",
+                                 placeholder="keren")
+        email = st.text_input("Correo", key="rg_email")
+        p1 = st.text_input("Contraseña", type="password", key="rg_p1")
+        p2 = st.text_input("Repetir contraseña", type="password", key="rg_p2")
+        codigo = ""
+        if codigo_req:
+            codigo = st.text_input("Código de registro", type="password", key="rg_code")
+        if st.button("Crear cuenta", type="primary", use_container_width=True, key="rg_btn"):
+            if codigo_req and codigo != codigo_req:
+                st.error("Código de registro inválido.")
+            elif p1 != p2:
+                st.error("Las contraseñas no coinciden.")
+            else:
+                ok, res = register_user(username, nombre, email, p1)
+                if ok:
+                    st.session_state["user"] = {
+                        "username": res["username"], "nombre": res["nombre"],
+                        "rol": res["rol"], "email": res["email"]}
+                    st.success(f"¡Bienvenida, {res['nombre']}!")
+                    st.rerun()
+                else:
+                    st.error(res)
+
     st.markdown("</div></div>", unsafe_allow_html=True)
     return False
+
+
+def page_usuarios():
+    head("Administración", "Usuarios", "Gestioná accesos al sistema")
+    df = load_usuarios()
+    if df.empty:
+        st.info("No hay usuarios registrados.")
+        return
+    show = df[["nombre", "username", "email", "rol", "creado"]].copy()
+    show.columns = ["Nombre", "Usuario", "Correo", "Rol", "Creado"]
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+    st.markdown('<div class="panel"><h3>Gestionar un usuario</h3>', unsafe_allow_html=True)
+    objetivo = st.selectbox("Usuario", df["username"].tolist())
+    fila = df[df["username"] == objetivo].iloc[0]
+    c1, c2, c3 = st.columns(3)
+    nuevo_rol = c1.selectbox("Rol", ["usuario", "admin"],
+                             index=0 if fila["rol"] != "admin" else 1)
+    nueva_pw = c2.text_input("Nueva contraseña (opcional)", type="password")
+    accion = c3.selectbox("Acción", ["Actualizar", "Eliminar usuario"])
+    if st.button("Aplicar", type="primary"):
+        me = st.session_state.get("user", {}).get("username")
+        if accion == "Eliminar usuario":
+            if objetivo == me:
+                st.error("No podés eliminar tu propia cuenta mientras la usás.")
+            else:
+                ndf = df[df["username"] != objetivo]
+                write_tab(USUARIOS_TAB, ndf, USUARIOS_COLS)
+                st.success(f"Usuario {objetivo} eliminado.")
+                st.rerun()
+        else:
+            df.loc[df["username"] == objetivo, "rol"] = nuevo_rol
+            if nueva_pw:
+                if len(nueva_pw) < 6:
+                    st.error("La contraseña debe tener al menos 6 caracteres.")
+                    st.stop()
+                df.loc[df["username"] == objetivo, "pass_hash"] = hash_password(nueva_pw)
+            write_tab(USUARIOS_TAB, df, USUARIOS_COLS)
+            st.success("Usuario actualizado.")
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1050,8 +1474,6 @@ def main():
     if not _secrets_ok():
         screen_setup()
         return
-    if not screen_login():
-        return
 
     try:
         ensure_schema()
@@ -1060,13 +1482,26 @@ def main():
         st.info("Verificá que el Sheet esté compartido con la service account y que el ID sea correcto.")
         return
 
+    if not screen_auth():
+        return
+
+    user = st.session_state["user"]
+    es_admin = str(user.get("rol", "")).lower() == "admin"
+
     # Sidebar
     with st.sidebar:
         if Path(LOGO).exists():
             st.image(LOGO, use_container_width=True)
         st.markdown(
             '<div style="text-align:center;letter-spacing:.3em;font-size:.62rem;'
-            'color:#9C7E3F;font-weight:600;margin:-6px 0 14px">CONTROL DE INVENTARIO</div>',
+            'color:#9C7E3F;font-weight:600;margin:-6px 0 10px">CONTROL DE INVENTARIO</div>',
+            unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="text-align:center;margin-bottom:12px">'
+            f'<span style="font-family:\'Playfair Display\',serif;font-size:1.02rem">'
+            f'Hola, {user["nombre"]}</span><br>'
+            f'<span style="font-size:.66rem;color:#B7A89F;letter-spacing:.08em">'
+            f'{"ADMINISTRADORA" if es_admin else "USUARIA"}</span></div>',
             unsafe_allow_html=True)
 
     PAGINAS = {
@@ -1075,17 +1510,24 @@ def main():
         "🛒  Registrar venta": page_registrar,
         "💳  Registrar pagos": page_pagos,
         "🧾  Historial de ventas": page_ventas,
-        "📊  Análisis de canal": page_analisis,
+        "📈  Análisis": page_analisis,
     }
+    if es_admin:
+        PAGINAS["👤  Usuarios"] = page_usuarios
+
     seleccion = st.sidebar.radio("Navegación", list(PAGINAS.keys()), label_visibility="collapsed")
 
     with st.sidebar:
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("↻ Refrescar datos", use_container_width=True):
+        cda, cdb = st.columns(2)
+        if cda.button("↻ Refrescar", use_container_width=True):
             read_tab.clear()
             st.rerun()
+        if cdb.button("⎋ Salir", use_container_width=True):
+            st.session_state.pop("user", None)
+            st.rerun()
         st.markdown(
-            '<div style="text-align:center;color:#B7A89F;font-size:.68rem;margin-top:1rem">'
+            '<div style="text-align:center;color:#B7A89F;font-size:.66rem;margin-top:1rem">'
             'Luminara Cosméticos · datos en vivo desde Google Sheets</div>',
             unsafe_allow_html=True)
 
