@@ -41,6 +41,7 @@ PRODUCTOS_COLS = [
 VENTAS_COLS = [
     "venta_id", "fecha", "sku", "cantidad", "canal", "precio_venta",
     "cliente", "metodo_pago", "estado_pago", "notas",
+    "precio_lista", "descuento_pct",
 ]
 PAGOS_COLS = [
     "pago_id", "fecha", "cliente", "monto", "metodo_pago", "tipo",
@@ -233,8 +234,15 @@ def ensure_schema():
             ws.update([cols], "A1")
         else:
             ws = existing[name]
-            if not ws.row_values(1):
+            cur = ws.row_values(1)
+            if not cur:
                 ws.update([cols], "A1")
+            elif any(c not in cur for c in cols):
+                # Migración: añade columnas nuevas al final preservando el orden existente
+                nuevo = cur + [c for c in cols if c not in cur]
+                if ws.col_count < len(nuevo):
+                    ws.add_cols(len(nuevo) - ws.col_count)
+                ws.update([nuevo], "A1")
     return True
 
 
@@ -408,7 +416,7 @@ def reset_password(login_id, new_password):
 #  TRANSFORMACIONES / MÉTRICAS
 # ──────────────────────────────────────────────────────────────────────────────
 NUM_PROD = ["costo_unit", "envio_unit", "cantidad_comprada", "precio_venta"]
-NUM_VENTA = ["cantidad", "precio_venta"]
+NUM_VENTA = ["cantidad", "precio_venta", "precio_lista", "descuento_pct"]
 
 
 def load_data():
@@ -443,6 +451,16 @@ def load_data():
         vent["categoria"] = vent["sku"].map(catmap).fillna("General")
         vent["ingreso"] = vent["precio_venta"] * vent["cantidad"]
         vent["ganancia"] = (vent["precio_venta"] - vent["costo_con_envio"]) * vent["cantidad"]
+        # Descuentos: precio_lista (normalizado) vs precio real
+        vent["precio_lista"] = pd.to_numeric(vent.get("precio_lista", 0), errors="coerce").fillna(0)
+        vent["descuento_pct"] = pd.to_numeric(vent.get("descuento_pct", 0), errors="coerce").fillna(0)
+        sin_lista = vent["precio_lista"] <= 0
+        vent.loc[sin_lista, "precio_lista"] = vent.loc[sin_lista, "precio_venta"]
+        vent["descuento_monto"] = ((vent["precio_lista"] - vent["precio_venta"]) * vent["cantidad"]).clip(lower=0)
+        recalc = vent["descuento_pct"] <= 0
+        vent.loc[recalc, "descuento_pct"] = (
+            (1 - vent.loc[recalc, "precio_venta"] / vent.loc[recalc, "precio_lista"].replace(0, pd.NA)) * 100
+        ).fillna(0).round(1)
         vent["fecha_dt"] = pd.to_datetime(vent["fecha"], errors="coerce")
     return prod, vent
 
@@ -747,7 +765,8 @@ def page_inventario():
 #  PÁGINA · REGISTRAR VENTA
 # ──────────────────────────────────────────────────────────────────────────────
 def page_registrar():
-    head("Nueva transacción", "Registrar venta", "El stock se descuenta automáticamente")
+    head("Nueva transacción", "Registrar venta",
+         "El stock se descuenta solo · soporta descuentos y muestra la ganancia al instante")
     prod, _ = load_data()
 
     disponibles = prod[(prod["activo"]) & (prod["stock"] > 0)].copy()
@@ -755,53 +774,86 @@ def page_registrar():
         st.warning("No hay productos con stock disponible. Agregá o reabastecé en **Inventario**.")
         return
 
+    vk = st.session_state.get("venta_key", 0)
     disponibles["etq"] = disponibles.apply(
-        lambda r: f"{r['nombre']}  ·  {q(r['precio_venta'])}  ·  stock {int(r['stock'])}", axis=1)
+        lambda r: f"{r['nombre']}  ·  {r['categoria']}  ·  {q(r['precio_venta'])}  ·  stock {int(r['stock'])}",
+        axis=1)
     opciones = dict(zip(disponibles["etq"], disponibles["sku"]))
 
-    with st.form("nueva_venta", clear_on_submit=True):
-        c1, c2 = st.columns([2, 1])
-        etq = c1.selectbox("Producto *", list(opciones.keys()))
-        sku = opciones[etq]
-        row = disponibles[disponibles["sku"] == sku].iloc[0]
-        max_stock = int(row["stock"])
-        cantidad = c2.number_input("Cantidad *", min_value=1, max_value=max_stock, value=1, step=1)
+    c1, c2 = st.columns([2, 1])
+    etq = c1.selectbox("Producto *", list(opciones.keys()), key=f"prod_{vk}")
+    sku = opciones[etq]
+    row = disponibles[disponibles["sku"] == sku].iloc[0]
+    max_stock = int(row["stock"])
+    lista = float(row["precio_venta"])
+    costo = float(row["costo_con_envio"])
+    cantidad = c2.number_input("Cantidad *", min_value=1, max_value=max_stock, value=1,
+                               step=1, key=f"cant_{vk}")
 
-        c3, c4, c5 = st.columns(3)
-        canal = c3.selectbox("Canal *", CANALES)
-        precio = c4.number_input("Precio de venta *", min_value=0.0,
-                                 value=float(row["precio_venta"]), step=1.0, format="%.2f")
-        fecha_v = c5.date_input("Fecha", value=date.today())
+    st.markdown(
+        f"""<div class="panel" style="margin:.2rem 0 .6rem">
+        <span style="color:var(--muted);font-size:.8rem">CATEGORÍA</span> <b>{row['categoria']}</b>
+        &nbsp;·&nbsp; <span style="color:var(--muted);font-size:.8rem">PRECIO DE LISTA</span> <b>{q(lista)}</b>
+        &nbsp;·&nbsp; <span style="color:var(--muted);font-size:.8rem">COSTO</span> <b>{q(costo)}</b>
+        </div>""", unsafe_allow_html=True)
 
-        c6, c7, c8 = st.columns(3)
-        cliente = c6.text_input("Cliente")
-        metodo = c7.selectbox("Método de pago", METODOS_PAGO)
-        estado = c8.selectbox("Estado de pago", ESTADOS_PAGO)
-        notas = st.text_input("Notas")
+    # Precio y descuento
+    modo = st.radio("Precio", ["Precio de lista", "Aplicar descuento %", "Precio final personalizado"],
+                    horizontal=True, key=f"modo_{vk}")
+    if modo == "Aplicar descuento %":
+        desc = st.number_input("Descuento %", min_value=0.0, max_value=100.0, value=0.0,
+                               step=5.0, format="%.1f", key=f"desc_{vk}")
+        precio = round(lista * (1 - desc / 100), 2)
+    elif modo == "Precio final personalizado":
+        precio = st.number_input("Precio final por unidad *", min_value=0.0, value=lista,
+                                 step=1.0, format="%.2f", key=f"pf_{vk}_{sku}")
+        desc = round((1 - precio / lista) * 100, 1) if lista > 0 else 0.0
+    else:
+        precio = lista
+        desc = 0.0
 
-        ganancia = (precio - row["costo_con_envio"]) * cantidad
-        st.markdown(
-            f"""<div class="panel" style="margin-top:.4rem">
-            <b>Resumen:</b> {int(cantidad)} × {row['nombre']} &nbsp;·&nbsp;
-            Ingreso <b>{q(precio*cantidad)}</b> &nbsp;·&nbsp;
-            Ganancia <b style="color:{GOLD_DARK}">{q(ganancia)}</b> &nbsp;·&nbsp;
-            Stock tras venta: <b>{max_stock-int(cantidad)}</b></div>""",
-            unsafe_allow_html=True,
-        )
+    c3, c4, c5 = st.columns(3)
+    canal = c3.selectbox("Canal *", CANALES, key=f"canal_{vk}")
+    metodo = c4.selectbox("Método de pago", METODOS_PAGO, key=f"met_{vk}")
+    estado = c5.selectbox("Estado de pago", ESTADOS_PAGO, key=f"est_{vk}")
+    c6, c7 = st.columns([2, 1])
+    cliente = c6.text_input("Cliente", key=f"cli_{vk}")
+    fecha_v = c7.date_input("Fecha", value=date.today(), key=f"fec_{vk}")
+    notas = st.text_input("Notas", key=f"not_{vk}")
 
-        if st.form_submit_button("✓ Registrar venta", type="primary"):
-            venta = {
-                "venta_id": str(uuid.uuid4())[:8], "fecha": fecha_v.isoformat(), "sku": sku,
-                "cantidad": int(cantidad), "canal": canal, "precio_venta": precio,
-                "cliente": cliente, "metodo_pago": metodo, "estado_pago": estado, "notas": notas,
-            }
-            try:
-                append_venta(venta)
-                st.success(f"Venta registrada · {int(cantidad)} × {row['nombre']} por {q(precio*cantidad)}")
-                st.balloons()
-                st.rerun()
-            except Exception as e:
-                st.error(f"No se pudo registrar: {e}")
+    ingreso = precio * cantidad
+    desc_monto = max(lista - precio, 0) * cantidad
+    ganancia = (precio - costo) * cantidad
+    color_gan = GOLD_DARK if ganancia >= 0 else "#C0392B"
+    desc_txt = (f'&nbsp;·&nbsp; Descuento <b style="color:{MAUVE}">{q(desc_monto)} ({desc:.0f}%)</b>'
+                if desc_monto > 0 else "")
+    st.markdown(
+        f"""<div class="panel" style="margin-top:.2rem">
+        <b>Resumen:</b> {int(cantidad)} × {row['nombre']} &nbsp;·&nbsp;
+        Precio unitario <b>{q(precio)}</b> {desc_txt} &nbsp;·&nbsp;
+        Ingreso <b>{q(ingreso)}</b> &nbsp;·&nbsp;
+        Ganancia <b style="color:{color_gan}">{q(ganancia)}</b> &nbsp;·&nbsp;
+        Stock tras venta: <b>{max_stock - int(cantidad)}</b></div>""",
+        unsafe_allow_html=True)
+    if ganancia < 0:
+        st.warning("⚠️ Esta venta da pérdida: el precio quedó por debajo del costo.")
+
+    if st.button("✓ Registrar venta", type="primary", key=f"btn_{vk}"):
+        venta = {
+            "venta_id": str(uuid.uuid4())[:8], "fecha": fecha_v.isoformat(), "sku": sku,
+            "cantidad": int(cantidad), "canal": canal, "precio_venta": round(precio, 2),
+            "cliente": cliente, "metodo_pago": metodo, "estado_pago": estado, "notas": notas,
+            "precio_lista": round(lista, 2), "descuento_pct": round(desc, 1),
+        }
+        try:
+            append_venta(venta)
+            st.session_state["venta_key"] = vk + 1
+            st.success(f"Venta registrada · {int(cantidad)} × {row['nombre']} por {q(ingreso)}"
+                       + (f" (descuento {desc:.0f}%)" if desc_monto > 0 else ""))
+            st.balloons()
+            st.rerun()
+        except Exception as e:
+            st.error(f"No se pudo registrar: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -814,15 +866,18 @@ def page_ventas():
         st.info("Aún no hay ventas registradas.")
         return
 
-    f1, f2, f3, f4 = st.columns(4)
+    f1, f2, f3, f4, f5 = st.columns(5)
     canal_f = f1.selectbox("Canal", ["Todos"] + sorted(vent["canal"].unique().tolist()))
-    estado_f = f2.selectbox("Estado", ["Todos"] + ESTADOS_PAGO)
-    metodo_f = f3.selectbox("Método", ["Todos"] + sorted(vent["metodo_pago"].unique().tolist()))
-    busca = f4.text_input("Cliente / producto", placeholder="Buscar…")
+    cat_f = f2.selectbox("Categoría", ["Todas"] + sorted(vent["categoria"].unique().tolist()))
+    estado_f = f3.selectbox("Estado", ["Todos"] + ESTADOS_PAGO)
+    metodo_f = f4.selectbox("Método", ["Todos"] + sorted(vent["metodo_pago"].unique().tolist()))
+    busca = f5.text_input("Cliente / producto", placeholder="Buscar…")
 
     v = vent.copy()
     if canal_f != "Todos":
         v = v[v["canal"] == canal_f]
+    if cat_f != "Todas":
+        v = v[v["categoria"] == cat_f]
     if estado_f != "Todos":
         v = v[v["estado_pago"] == estado_f]
     if metodo_f != "Todos":
@@ -831,23 +886,34 @@ def page_ventas():
         b = busca.lower()
         v = v[v["cliente"].str.lower().str.contains(b) | v["nombre"].str.lower().str.contains(b)]
 
+    pendiente = v.loc[v["estado_pago"] == "Pendiente", "ingreso"].sum()
+    apartado = v.loc[v["estado_pago"] == "Apartado", "ingreso"].sum()
+    por_cobrar = pendiente + apartado
     kpi_grid([
-        ("Registros", str(len(v)), ""),
-        ("Unidades", str(int(v["cantidad"].sum())), ""),
+        ("Registros", str(len(v)), f"{int(v['cantidad'].sum())} unidades"),
         ("Ingresos", q(v["ingreso"].sum()), ""),
         ("Ganancia", q(v["ganancia"].sum()), ""),
+        ("Por cobrar", q(por_cobrar), f"Pendiente {q(pendiente)} · Apartado {q(apartado)}"),
+        ("Descuentos", q(v["descuento_monto"].sum()), "total concedido"),
     ])
+    if canal_f != "Todos":
+        st.caption(f"Mostrando **{canal_f}**: vendido {q(v['ingreso'].sum())} · "
+                   f"por cobrar {q(por_cobrar)} ({len(v[v['estado_pago'].isin(['Pendiente','Apartado'])])} ventas).")
 
     tab_ver, tab_edit = st.tabs(["📋 Ver", "✏️ Editar"])
     with tab_ver:
-        show = v[["fecha", "nombre", "canal", "cantidad", "precio_venta", "ingreso",
-                  "ganancia", "cliente", "metodo_pago", "estado_pago", "notas"]].copy()
-        show.columns = ["Fecha", "Producto", "Canal", "Cant.", "Precio", "Ingreso",
-                        "Ganancia", "Cliente", "Pago", "Estado", "Notas"]
+        show = v[["fecha", "nombre", "categoria", "canal", "cantidad", "precio_lista",
+                  "precio_venta", "descuento_pct", "ingreso", "ganancia", "cliente",
+                  "metodo_pago", "estado_pago", "notas"]].copy()
+        show.columns = ["Fecha", "Producto", "Categoría", "Canal", "Cant.", "Lista",
+                        "Precio", "Desc. %", "Ingreso", "Ganancia", "Cliente", "Pago",
+                        "Estado", "Notas"]
         st.dataframe(
             show.sort_values("Fecha", ascending=False), use_container_width=True, hide_index=True,
             column_config={
+                "Lista": st.column_config.NumberColumn(format="Q%.2f"),
                 "Precio": st.column_config.NumberColumn(format="Q%.2f"),
+                "Desc. %": st.column_config.NumberColumn(format="%.0f%%"),
                 "Ingreso": st.column_config.NumberColumn(format="Q%.2f"),
                 "Ganancia": st.column_config.NumberColumn(format="Q%.2f"),
             },
@@ -868,6 +934,8 @@ def page_ventas():
                 "metodo_pago": st.column_config.SelectboxColumn("Pago", options=METODOS_PAGO),
                 "estado_pago": st.column_config.SelectboxColumn("Estado", options=ESTADOS_PAGO),
                 "notas": st.column_config.TextColumn("Notas"),
+                "precio_lista": st.column_config.NumberColumn("Precio lista", format="%.2f"),
+                "descuento_pct": st.column_config.NumberColumn("Desc. %", format="%.1f"),
             },
         )
         if st.button("💾 Guardar cambios de ventas", type="primary"):
@@ -1238,7 +1306,8 @@ def page_pagos():
         st.info("📎 Para adjuntar fotos o PDFs, configurá `gcs_bucket` en los Secrets "
                 "(ver README). Mientras tanto podés registrar pagos sin comprobante.")
 
-    tab_reg, tab_hist = st.tabs(["💳 Registrar pago", "🧾 Historial de pagos"])
+    tab_reg, tab_cobrar, tab_hist = st.tabs(
+        ["💳 Registrar pago", "📋 Cuentas por cobrar", "🧾 Historial de pagos"])
 
     # ── Registrar ──────────────────────────────────────────────────────────
     with tab_reg:
@@ -1306,6 +1375,52 @@ def page_pagos():
                         st.rerun()
                     except Exception as e:
                         st.error(f"No se pudo registrar el pago: {e}")
+
+    # ── Cuentas por cobrar (quién debe) ──────────────────────────────────────
+    with tab_cobrar:
+        if vent.empty:
+            st.info("Sin ventas registradas.")
+        else:
+            ctc = vent[vent["estado_pago"].isin(["Pendiente", "Apartado"])].copy()
+            if ctc.empty:
+                st.success("No hay cuentas por cobrar. Todo está pagado. 🎉")
+            else:
+                ctc["cliente_norm"] = ctc["cliente"].astype(str).str.strip().replace("", "(Sin nombre)")
+                piv = ctc.pivot_table(index="cliente_norm", columns="estado_pago",
+                                      values="ingreso", aggfunc="sum", fill_value=0)
+                for col in ["Pendiente", "Apartado"]:
+                    if col not in piv.columns:
+                        piv[col] = 0
+                resumen = piv.reset_index()
+                resumen["total"] = resumen["Pendiente"] + resumen["Apartado"]
+                cnt = ctc.groupby("cliente_norm")["venta_id"].count()
+                resumen["ventas"] = resumen["cliente_norm"].map(cnt).fillna(0).astype(int)
+                resumen = resumen.rename(columns={"Pendiente": "pendiente", "Apartado": "apartado"})
+                resumen = resumen[["cliente_norm", "pendiente", "apartado", "total", "ventas"]]
+                resumen = resumen.sort_values("total", ascending=False)
+                kpi_grid([
+                    ("Clientes que deben", str(len(resumen)), ""),
+                    ("Pendiente de pago", q(resumen["pendiente"].sum()), ""),
+                    ("Apartado (reservado)", q(resumen["apartado"].sum()), ""),
+                    ("Total por cobrar", q(resumen["total"].sum()), ""),
+                ])
+                tab = resumen.copy()
+                tab.columns = ["Cliente", "Pendiente", "Apartado", "Total", "Ventas"]
+                st.dataframe(tab, use_container_width=True, hide_index=True, column_config={
+                    "Pendiente": st.column_config.NumberColumn(format="Q%.2f"),
+                    "Apartado": st.column_config.NumberColumn(format="Q%.2f"),
+                    "Total": st.column_config.NumberColumn(format="Q%.2f")})
+
+                st.markdown("**Detalle por venta**")
+                det = ctc[["fecha", "cliente_norm", "nombre", "canal", "cantidad",
+                           "ingreso", "estado_pago", "metodo_pago"]].copy()
+                det.columns = ["Fecha", "Cliente", "Producto", "Canal", "Cant.",
+                               "Monto", "Estado", "Método"]
+                st.dataframe(det.sort_values(["Estado", "Cliente"]), use_container_width=True,
+                             hide_index=True, column_config={
+                                 "Monto": st.column_config.NumberColumn(format="Q%.2f")})
+                st.caption("Para registrar el cobro y marcarlas como pagadas, usá la pestaña "
+                           "**Registrar pago**.")
 
     # ── Historial ──────────────────────────────────────────────────────────
     with tab_hist:
