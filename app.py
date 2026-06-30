@@ -32,6 +32,7 @@ PRODUCTOS_TAB = "Productos"
 VENTAS_TAB = "Ventas"
 PAGOS_TAB = "Pagos"
 USUARIOS_TAB = "Usuarios"
+COMPRAS_TAB = "Compras"
 
 PRODUCTOS_COLS = [
     "sku", "linea", "tono", "categoria", "pedido", "fecha_pedido",
@@ -48,6 +49,8 @@ PAGOS_COLS = [
     "referencia", "ventas_ids", "comprobante", "notas",
 ]
 USUARIOS_COLS = ["username", "nombre", "email", "rol", "pass_hash", "creado"]
+COMPRAS_COLS = ["compra_id", "fecha", "sku", "pedido", "cantidad", "costo_unit",
+                "envio_unit", "notas"]
 
 # Quien registre con estos correos o nombres entra como administrador
 ADMIN_EMAILS = {"juanpabloorozcoperez89@gmail.com"}
@@ -228,7 +231,8 @@ def ensure_schema():
     ss = get_spreadsheet()
     existing = {w.title: w for w in ss.worksheets()}
     for name, cols in [(PRODUCTOS_TAB, PRODUCTOS_COLS), (VENTAS_TAB, VENTAS_COLS),
-                       (PAGOS_TAB, PAGOS_COLS), (USUARIOS_TAB, USUARIOS_COLS)]:
+                       (PAGOS_TAB, PAGOS_COLS), (USUARIOS_TAB, USUARIOS_COLS),
+                       (COMPRAS_TAB, COMPRAS_COLS)]:
         if name not in existing:
             ws = ss.add_worksheet(title=name, rows=300, cols=len(cols))
             ws.update([cols], "A1")
@@ -276,6 +280,12 @@ def append_venta(row: dict):
 def append_pago(row: dict):
     ws = get_spreadsheet().worksheet(PAGOS_TAB)
     ws.append_row([row.get(c, "") for c in PAGOS_COLS], value_input_option="USER_ENTERED")
+    read_tab.clear()
+
+
+def append_compra(row: dict):
+    ws = get_spreadsheet().worksheet(COMPRAS_TAB)
+    ws.append_row([row.get(c, "") for c in COMPRAS_COLS], value_input_option="USER_ENTERED")
     read_tab.clear()
 
 
@@ -419,9 +429,22 @@ NUM_PROD = ["costo_unit", "envio_unit", "cantidad_comprada", "precio_venta"]
 NUM_VENTA = ["cantidad", "precio_venta", "precio_lista", "descuento_pct"]
 
 
+def load_compras() -> pd.DataFrame:
+    cp = read_tab(COMPRAS_TAB, COMPRAS_COLS).copy()
+    if cp.empty:
+        return cp
+    for c in ["cantidad", "costo_unit", "envio_unit"]:
+        cp[c] = pd.to_numeric(cp[c], errors="coerce").fillna(0)
+    cp["costo_con_envio"] = cp["costo_unit"] + cp["envio_unit"]
+    cp["inversion"] = cp["costo_con_envio"] * cp["cantidad"]
+    cp["fecha_dt"] = pd.to_datetime(cp["fecha"], errors="coerce")
+    return cp
+
+
 def load_data():
     prod = read_tab(PRODUCTOS_TAB, PRODUCTOS_COLS).copy()
     vent = read_tab(VENTAS_TAB, VENTAS_COLS).copy()
+    compras = load_compras()
 
     for c in NUM_PROD:
         prod[c] = pd.to_numeric(prod[c], errors="coerce").fillna(0)
@@ -429,14 +452,27 @@ def load_data():
         vent[c] = pd.to_numeric(vent[c], errors="coerce").fillna(0)
 
     prod["activo"] = prod["activo"].astype(str).str.upper().isin(["TRUE", "1", "SI", "SÍ", "VERDADERO", "X"])
-    prod["costo_con_envio"] = prod["costo_unit"] + prod["envio_unit"]
-    prod["inversion"] = prod["costo_con_envio"] * prod["cantidad_comprada"]
+
+    # Lote base (la fila del producto) + lotes adicionales (pestaña Compras)
+    base_cant = prod["cantidad_comprada"]
+    base_inv = (prod["costo_unit"] + prod["envio_unit"]) * base_cant
+    if not compras.empty:
+        add_cant = compras.groupby("sku")["cantidad"].sum()
+        add_inv = compras.groupby("sku")["inversion"].sum()
+        add_lotes = compras.groupby("sku")["compra_id"].count()
+    else:
+        add_cant = add_inv = add_lotes = pd.Series(dtype=float)
+    prod["cantidad_comprada"] = (base_cant + prod["sku"].map(add_cant).fillna(0)).astype(float)
+    prod["inversion"] = base_inv + prod["sku"].map(add_inv).fillna(0)
+    prod["lotes"] = 1 + prod["sku"].map(add_lotes).fillna(0).astype(int)
+    prod["costo_con_envio"] = (prod["inversion"] / prod["cantidad_comprada"].replace(0, pd.NA)).fillna(0)
     prod["ganancia_unidad"] = prod["precio_venta"] - prod["costo_con_envio"]
     prod["nombre"] = (prod["tono"].astype(str).str.strip() + " " + prod["linea"].astype(str).str.strip()).str.strip()
 
     # vendido por sku
     vendidos = vent.groupby("sku")["cantidad"].sum() if not vent.empty else pd.Series(dtype=float)
     prod["vendidos"] = prod["sku"].map(vendidos).fillna(0).astype(int)
+    prod["cantidad_comprada"] = prod["cantidad_comprada"].astype(int)
     prod["stock"] = (prod["cantidad_comprada"] - prod["vendidos"]).clip(lower=0)
     prod["valor_stock_costo"] = prod["stock"] * prod["costo_con_envio"]
     prod["valor_stock_venta"] = prod["stock"] * prod["precio_venta"]
@@ -663,20 +699,24 @@ def page_inventario():
         ("Agotados", str(agotados), ""),
     ])
 
-    tab_ver, tab_edit, tab_add = st.tabs(["📋 Existencias", "✏️ Editar catálogo", "➕ Agregar producto"])
+    tab_ver, tab_edit, tab_add, tab_compras = st.tabs(
+        ["📋 Existencias", "✏️ Editar catálogo", "➕ Agregar producto", "📥 Compras / Lotes"])
 
     with tab_ver:
-        show = view[["sku", "nombre", "categoria", "pedido", "costo_con_envio",
+        show = view[["sku", "nombre", "categoria", "costo_con_envio", "lotes",
                      "precio_venta", "ganancia_unidad", "cantidad_comprada",
                      "vendidos", "stock", "valor_stock_venta"]].copy()
-        show.columns = ["SKU", "Producto", "Categoría", "Pedido", "Costo", "Precio",
+        show.columns = ["SKU", "Producto", "Categoría", "Costo prom.", "Lotes", "Precio",
                         "Gan./u", "Comprado", "Vendido", "Stock", "Valor stock"]
         _maxc = prod["cantidad_comprada"].max()
         stock_max = int(_maxc) if pd.notna(_maxc) and _maxc > 0 else 1
         st.dataframe(
             show, use_container_width=True, hide_index=True,
             column_config={
-                "Costo": st.column_config.NumberColumn(format="Q%.2f"),
+                "Costo prom.": st.column_config.NumberColumn(format="Q%.2f",
+                    help="Costo promedio ponderado entre todos los lotes de compra"),
+                "Lotes": st.column_config.NumberColumn(format="%d",
+                    help="Cantidad de compras (lote base + reabastecimientos)"),
                 "Precio": st.column_config.NumberColumn(format="Q%.2f"),
                 "Gan./u": st.column_config.NumberColumn(format="Q%.2f"),
                 "Valor stock": st.column_config.NumberColumn(format="Q%.2f"),
@@ -684,11 +724,18 @@ def page_inventario():
                     format="%d", min_value=0, max_value=stock_max),
             },
         )
+        st.caption("**Costo prom.** = costo promedio ponderado de todos los lotes. "
+                   "Si un tono se compró en varios pedidos con envíos distintos, agregá cada "
+                   "compra en la pestaña **Compras / Lotes** y el costo se ajusta solo.")
 
     with tab_edit:
-        st.caption("Editá precios, costos, cantidades o desactivá productos. Guardá para escribir al Google Sheet.")
-        edit_cols = PRODUCTOS_COLS
-        editable = prod[edit_cols].copy()
+        st.caption("Editá el catálogo y el **lote base** (la primera compra) de cada producto. "
+                   "Los reabastecimientos posteriores van en la pestaña **Compras / Lotes**.")
+        editable = read_tab(PRODUCTOS_TAB, PRODUCTOS_COLS).copy()
+        for c in NUM_PROD:
+            editable[c] = pd.to_numeric(editable[c], errors="coerce").fillna(0)
+        editable["activo"] = editable["activo"].astype(str).str.upper().isin(
+            ["TRUE", "1", "SI", "SÍ", "VERDADERO", "X"])
         edited = st.data_editor(
             editable, use_container_width=True, hide_index=True, num_rows="dynamic",
             key="ed_prod",
@@ -697,11 +744,11 @@ def page_inventario():
                 "linea": st.column_config.TextColumn("Línea", required=True),
                 "tono": st.column_config.TextColumn("Tono"),
                 "categoria": st.column_config.SelectboxColumn("Categoría", options=CATEGORIAS),
-                "pedido": st.column_config.TextColumn("Pedido"),
-                "fecha_pedido": st.column_config.TextColumn("Fecha pedido"),
-                "costo_unit": st.column_config.NumberColumn("Costo unit.", format="%.2f", min_value=0),
-                "envio_unit": st.column_config.NumberColumn("Envío unit.", format="%.2f", min_value=0),
-                "cantidad_comprada": st.column_config.NumberColumn("Comprado", min_value=0, step=1),
+                "pedido": st.column_config.TextColumn("Pedido (base)"),
+                "fecha_pedido": st.column_config.TextColumn("Fecha (base)"),
+                "costo_unit": st.column_config.NumberColumn("Costo unit. (base)", format="%.2f", min_value=0),
+                "envio_unit": st.column_config.NumberColumn("Envío unit. (base)", format="%.2f", min_value=0),
+                "cantidad_comprada": st.column_config.NumberColumn("Comprado (base)", min_value=0, step=1),
                 "precio_venta": st.column_config.NumberColumn("Precio venta", format="%.2f", min_value=0),
                 "activo": st.column_config.CheckboxColumn("Activo"),
                 "notas": st.column_config.TextColumn("Notas"),
@@ -718,6 +765,9 @@ def page_inventario():
                 st.error(f"No se pudo guardar: {e}")
 
     with tab_add:
+        st.caption("Aquí registrás el producto y su **primer lote** de compra. "
+                   "Si luego volvés a pedir el mismo tono (aunque sea con otro envío), "
+                   "no lo agregués de nuevo: registralo en **Compras / Lotes**.")
         with st.form("nuevo_prod", clear_on_submit=True):
             c1, c2, c3 = st.columns(3)
             linea = c1.text_input("Línea *", placeholder="Hydra Lipgloss")
@@ -725,11 +775,11 @@ def page_inventario():
             categoria = c3.selectbox("Categoría", CATEGORIAS)
             c4, c5, c6 = st.columns(3)
             costo = c4.number_input("Costo unitario *", min_value=0.0, step=1.0, format="%.2f")
-            envio = c5.number_input("Envío unitario", min_value=0.0, step=1.0, format="%.2f")
-            cantidad = c6.number_input("Cantidad comprada *", min_value=0, step=1)
+            envio = c5.number_input("Envío unitario (lote base)", min_value=0.0, step=1.0, format="%.2f")
+            cantidad = c6.number_input("Cantidad (lote base) *", min_value=0, step=1)
             c7, c8, c9 = st.columns(3)
             precio = c7.number_input("Precio de venta *", min_value=0.0, step=1.0, format="%.2f")
-            pedido = c8.text_input("Pedido / lote", placeholder="Pedido 4")
+            pedido = c8.text_input("Pedido / lote", placeholder="Pedido 1")
             fecha_p = c9.date_input("Fecha del pedido", value=date.today())
             sugerido = (costo + envio) * 1.30
             st.caption(f"Precio sugerido (+30%): **{q(sugerido)}**  ·  Ganancia/u con precio actual: "
@@ -759,6 +809,82 @@ def page_inventario():
                         st.rerun()
                     except Exception as e:
                         st.error(f"No se pudo agregar: {e}")
+
+    with tab_compras:
+        st.markdown("#### Reabastecimientos (lotes de compra)")
+        st.caption("Cuando volvés a pedir un producto que ya existe —aunque el envío salga a "
+                   "otro precio— registralo acá. El sistema suma las cantidades y recalcula el "
+                   "**costo promedio ponderado** automáticamente. No se mezcla mal nunca más.")
+        compras = load_compras()
+
+        cat = prod[["sku", "nombre"]].copy()
+        opts = {f"{r['nombre']}  ({r['sku']})": r["sku"] for _, r in cat.iterrows()}
+
+        ck = st.session_state.get("compra_key", 0)
+        with st.form("nueva_compra", clear_on_submit=True):
+            cc1, cc2, cc3 = st.columns([2, 1, 1])
+            psel = cc1.selectbox("Producto *", list(opts.keys()), key=f"cp_prod_{ck}")
+            cantidad_c = cc2.number_input("Cantidad *", min_value=1, step=1, key=f"cp_cant_{ck}")
+            pedido_c = cc3.text_input("Pedido", placeholder="Pedido 4", key=f"cp_ped_{ck}")
+            cc4, cc5, cc6 = st.columns(3)
+            costo_c = cc4.number_input("Costo unitario *", min_value=0.0, step=1.0, format="%.2f",
+                                       key=f"cp_costo_{ck}")
+            envio_c = cc5.number_input("Envío unitario *", min_value=0.0, step=1.0, format="%.2f",
+                                       key=f"cp_envio_{ck}")
+            fecha_c = cc6.date_input("Fecha", value=date.today(), key=f"cp_fec_{ck}")
+            notas_c = st.text_input("Notas", key=f"cp_not_{ck}")
+            landed = costo_c + envio_c
+            st.caption(f"Este lote: {int(cantidad_c)} u. · costo c/envío **{q(landed)}**/u · "
+                       f"inversión **{q(landed * cantidad_c)}**")
+            if st.form_submit_button("📥 Registrar compra", type="primary"):
+                compra = {
+                    "compra_id": str(uuid.uuid4())[:8], "fecha": fecha_c.isoformat(),
+                    "sku": opts[psel], "pedido": pedido_c, "cantidad": int(cantidad_c),
+                    "costo_unit": costo_c, "envio_unit": envio_c, "notas": notas_c,
+                }
+                try:
+                    append_compra(compra)
+                    st.session_state["compra_key"] = ck + 1
+                    st.success(f"Compra registrada: {int(cantidad_c)} u. de {psel}")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo registrar la compra: {e}")
+
+        st.markdown("---")
+        if compras.empty:
+            st.info("Todavía no hay reabastecimientos registrados. El inventario usa el lote base "
+                    "de cada producto.")
+        else:
+            inv_total = compras["inversion"].sum()
+            kpi_grid([
+                ("Lotes adicionales", str(len(compras)), ""),
+                ("Unidades compradas", str(int(compras["cantidad"].sum())), ""),
+                ("Inversión en lotes", q(inv_total), "aparte del lote base"),
+            ])
+            nmap = prod.set_index("sku")["nombre"].to_dict()
+            vis = compras.copy()
+            vis["producto"] = vis["sku"].map(nmap).fillna(vis["sku"])
+            st.markdown("**Editar lotes** (corregí cantidades, costos o envíos; borrá una fila para anularla)")
+            ed = st.data_editor(
+                vis[COMPRAS_COLS], use_container_width=True, hide_index=True,
+                num_rows="dynamic", key="ed_compras",
+                column_config={
+                    "compra_id": st.column_config.TextColumn("ID", disabled=True),
+                    "fecha": st.column_config.TextColumn("Fecha"),
+                    "sku": st.column_config.TextColumn("SKU"),
+                    "pedido": st.column_config.TextColumn("Pedido"),
+                    "cantidad": st.column_config.NumberColumn("Cantidad", min_value=0, step=1),
+                    "costo_unit": st.column_config.NumberColumn("Costo unit.", format="%.2f", min_value=0),
+                    "envio_unit": st.column_config.NumberColumn("Envío unit.", format="%.2f", min_value=0),
+                    "notas": st.column_config.TextColumn("Notas"),
+                })
+            if st.button("💾 Guardar lotes", type="primary"):
+                try:
+                    write_tab(COMPRAS_TAB, ed, COMPRAS_COLS)
+                    st.success("Lotes actualizados.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo guardar: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1113,17 +1239,28 @@ def page_analisis():
                             config={"displayModeBar": False})
             st.markdown("</div>", unsafe_allow_html=True)
 
-            st.markdown('<div class="panel"><h3>ROI por pedido</h3>', unsafe_allow_html=True)
-            ped = prod.groupby("pedido").agg(inversion=("inversion", "sum")).reset_index()
-            gv = vent.groupby(prod.set_index("sku")["pedido"].reindex(vent["sku"]).values)["ganancia"].sum() \
-                if not vent.empty else pd.Series(dtype=float)
-            ped["ganancia"] = ped["pedido"].map(gv).fillna(0)
-            ped["ROI %"] = (ped["ganancia"] / ped["inversion"].replace(0, 1) * 100).round(0)
-            ped.columns = ["Pedido", "Inversión", "Ganancia realizada", "ROI %"]
+            st.markdown('<div class="panel"><h3>Inversión por pedido</h3>', unsafe_allow_html=True)
+            compras = load_compras()
+            # inversión del lote base por pedido
+            raw = read_tab(PRODUCTOS_TAB, PRODUCTOS_COLS).copy()
+            for c in ["costo_unit", "envio_unit", "cantidad_comprada"]:
+                raw[c] = pd.to_numeric(raw[c], errors="coerce").fillna(0)
+            raw["inv"] = (raw["costo_unit"] + raw["envio_unit"]) * raw["cantidad_comprada"]
+            ped = raw.groupby(raw["pedido"].replace("", "Sin pedido")).agg(
+                inversion=("inv", "sum"), unidades=("cantidad_comprada", "sum")).reset_index()
+            ped.columns = ["pedido", "inversion", "unidades"]
+            if not compras.empty:
+                cp = compras.groupby(compras["pedido"].replace("", "Sin pedido")).agg(
+                    inversion=("inversion", "sum"), unidades=("cantidad", "sum")).reset_index()
+                cp.columns = ["pedido", "inversion", "unidades"]
+                ped = pd.concat([ped, cp]).groupby("pedido", as_index=False).sum()
+            ped["costo_prom"] = (ped["inversion"] / ped["unidades"].replace(0, 1)).round(2)
+            ped = ped.sort_values("inversion", ascending=False)
+            ped.columns = ["Pedido", "Inversión", "Unidades", "Costo prom./u"]
             st.dataframe(ped, use_container_width=True, hide_index=True, column_config={
                 "Inversión": st.column_config.NumberColumn(format="Q%.2f"),
-                "Ganancia realizada": st.column_config.NumberColumn(format="Q%.2f"),
-                "ROI %": st.column_config.NumberColumn(format="%.0f%%")})
+                "Costo prom./u": st.column_config.NumberColumn(format="Q%.2f")})
+            st.caption("Suma el lote base de cada producto y los reabastecimientos de la pestaña Compras.")
             st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Ventas & canales ──────────────────────────────────────────────────────
